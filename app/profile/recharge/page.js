@@ -7,12 +7,33 @@ import BackHeader from '../components/BackHeader'
 import BottomNav from '../../components/BottomNav'
 import { API_BASE_URL, apiFetch } from '@/lib/api'
 
+function loadRazorpayScript() {
+  return new Promise((resolve, reject) => {
+    if (typeof window !== 'undefined' && window.Razorpay) {
+      resolve(true)
+      return
+    }
+    const existing = document.querySelector('script[src="https://checkout.razorpay.com/v1/checkout.js"]')
+    if (existing) {
+      existing.addEventListener('load', () => resolve(true))
+      existing.addEventListener('error', () => reject(new Error('Gateway failed to load')))
+      return
+    }
+    const script = document.createElement('script')
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js'
+    script.onload = () => resolve(true)
+    script.onerror = () => reject(new Error('Payment gateway failed to load. Check connection and retry.'))
+    document.body.appendChild(script)
+  })
+}
+
 export default function RechargePage() {
   const router = useRouter()
   const [plans, setPlans] = useState([])
   const [quota, setQuota] = useState(null)
   const [loading, setLoading] = useState(true)
   const [subscribing, setSubscribing] = useState(null)
+  const [paying, setPaying] = useState(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -44,6 +65,7 @@ export default function RechargePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Existing manual/demo activation — kept as-is (admin manual flow untouched).
   const subscribe = async (planId) => {
     setSubscribing(planId)
     setError('')
@@ -64,6 +86,65 @@ export default function RechargePage() {
       setError('Network error. Please try again.')
     } finally {
       setSubscribing(null)
+    }
+  }
+
+  // New: Razorpay online payment (wahhtrips pattern: order -> checkout -> verify).
+  const payOnline = async (plan) => {
+    setPaying(plan.id)
+    setError('')
+    setNotice('')
+    try {
+      await loadRazorpayScript()
+      const orderRes = await apiFetch(`${API_BASE_URL}/payments/subscription/order?plan_id=${plan.id}`, {
+        method: 'POST',
+      })
+      const orderData = await orderRes.json().catch(() => ({}))
+      if (!orderRes.ok) {
+        setError(orderData.detail || 'Could not start online payment. Try manual activation or contact admin.')
+        return
+      }
+      const options = {
+        key: orderData.key_id,
+        amount: orderData.amount,
+        currency: orderData.currency || 'INR',
+        order_id: orderData.order_id,
+        name: 'Kazilen',
+        description: `${plan.name} membership (${plan.duration_days} days)`,
+        theme: { color: '#ff8a4c' },
+        modal: { ondismiss: () => setPaying(null) },
+        handler: async (resp) => {
+          try {
+            const verifyRes = await apiFetch(`${API_BASE_URL}/payments/subscription/verify`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                razorpay_order_id: resp.razorpay_order_id,
+                razorpay_payment_id: resp.razorpay_payment_id,
+                razorpay_signature: resp.razorpay_signature,
+              }),
+            })
+            const verifyData = await verifyRes.json().catch(() => ({}))
+            if (!verifyRes.ok) {
+              setError(verifyData.detail || 'Payment verification failed. If money was debited it will auto-confirm shortly — check again in a minute.')
+              return
+            }
+            setNotice('Payment successful. Subscription activated.')
+            setQuota(verifyData.quota || null)
+            await load()
+          } catch {
+            setError('Verification failed. If money was debited it will auto-confirm via webhook — check again shortly.')
+          } finally {
+            setPaying(null)
+          }
+        },
+      }
+      const rzp = new window.Razorpay(options)
+      rzp.on('payment.failed', () => setPaying(null))
+      rzp.open()
+    } catch (err) {
+      setError(err?.message || 'Online payment could not start. Please try again.')
+      setPaying(null)
     }
   }
 
@@ -111,6 +192,8 @@ export default function RechargePage() {
               })
               .map((plan) => {
               const isCurrent = quota?.subscribed && quota?.subscription?.plan_id === plan.id
+              const isPaid = (plan.price || 0) > 0
+              const busy = subscribing === plan.id || paying === plan.id
               return (
                 <div key={plan.id} className={`bg-white rounded-md border p-5 shadow-2xs space-y-3 ${isCurrent ? 'border-emerald-300' : 'border-slate-200'}`}>
                   <div className="flex items-start justify-between gap-2">
@@ -144,12 +227,21 @@ export default function RechargePage() {
                     </ul>
                   )}
 
+                  {isPaid && (
+                    <button
+                      onClick={() => payOnline(plan)}
+                      disabled={busy}
+                      className="w-full py-2.5 rounded-sm bg-[#ff8a4c] hover:bg-[#f07432] text-white text-xs font-bold transition disabled:opacity-60 cursor-pointer"
+                    >
+                      {paying === plan.id ? 'Opening payment…' : isCurrent ? 'Renew with UPI / Card' : 'Pay Online (UPI / Card)'}
+                    </button>
+                  )}
                   <button
                     onClick={() => subscribe(plan.id)}
-                    disabled={subscribing === plan.id}
-                    className="w-full py-2.5 rounded-sm bg-[#ff8a4c] hover:bg-[#f07432] text-white text-xs font-bold transition disabled:opacity-60 cursor-pointer"
+                    disabled={busy}
+                    className="w-full py-2 rounded-sm bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold border border-slate-300 transition disabled:opacity-60 cursor-pointer"
                   >
-                    {subscribing === plan.id ? 'Activating…' : isCurrent ? 'Renew plan' : 'Subscribe'}
+                    {subscribing === plan.id ? 'Activating…' : isPaid ? 'Or activate manually (demo)' : 'Subscribe'}
                   </button>
                 </div>
               )
@@ -162,7 +254,7 @@ export default function RechargePage() {
         )}
 
         <p className="text-[11px] text-slate-400 leading-relaxed">
-          Demo checkout: subscribing activates the plan instantly and resets the booking quota from now. Plug a UPI/card gateway here before production.
+          Online payments are processed securely by Razorpay (UPI, cards, netbanking). If money is debited but the plan does not activate instantly, it auto-confirms within a few minutes — just reopen this page.
         </p>
       </main>
 
